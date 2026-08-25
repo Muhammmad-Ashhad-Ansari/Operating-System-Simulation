@@ -1,0 +1,325 @@
+/*
+ * Smart Hospital Operating Subsystem (SHOS)
+ * Final Integrated Solution for CCP - Fall 2025
+ * * Features Implemented:
+ * 1. Multilevel CPU Scheduling (Priority + RR + Aging)
+ * 2. Memory Management (Paging + LRU Replacement)
+ * 3. Secure File Vault (Encryption + RBAC + Logging)
+ */
+
+#include <iostream>
+#include <vector>
+#include <deque>
+#include <map>
+#include <string>
+#include <fstream>
+#include <ctime>
+#include <algorithm>
+#include <thread>
+#include <chrono>
+
+using namespace std;
+
+// --- CONFIGURATION ---
+const int TIME_QUANTUM = 3;       // For Round Robin (Normal Tasks)
+const int AGING_THRESHOLD = 5;    // Cycles before promotion
+const int TOTAL_FRAMES = 5;       // Simulating limited RAM (5 Frames)
+
+// --- ENUMS & STRUCTURES ---
+enum ProcessType { HEALTHCARE, NORMAL };
+enum Role { ADMIN, DOCTOR, NURSE };
+
+struct Process {
+    int id;
+    ProcessType type;
+    int priority;       // Higher value = Higher Priority
+    int burstTime;
+    int remainingTime;
+    int waitInQueue;    // Tracks how long it has waited (for Aging)
+    
+    Process(int pid, ProcessType pType, int prio, int burst) 
+        : id(pid), type(pType), priority(prio), burstTime(burst), 
+          remainingTime(burst), waitInQueue(0) {}
+};
+
+struct FileRecord {
+    string filename;
+    string encryptedContent;
+};
+
+// ==========================================
+// MODULE 1: MEMORY MANAGEMENT (LRU Paging)
+// ==========================================
+class MemoryManager {
+    struct PageEntry { int pageID; int lastAccessTime; };
+    vector<int> frames;          // Physical Memory
+    vector<PageEntry> pageTable; // Logical to Physical Map
+    int currentTime = 0;
+    int hits = 0, faults = 0;
+
+public:
+    MemoryManager() { frames.reserve(TOTAL_FRAMES); }
+
+    void accessPage(int pageID) {
+        currentTime++;
+        bool found = false;
+        
+        // 1. Check if page is in memory
+        for (auto &entry : pageTable) {
+            if (entry.pageID == pageID) {
+                entry.lastAccessTime = currentTime; // Update for LRU
+                hits++;
+                found = true;
+                cout << "   [Memory] Page " << pageID << " -> HIT (Frame Available)\n";
+                break;
+            }
+        }
+
+        // 2. Page Fault Handling
+        if (!found) {
+            faults++;
+            cout << "   [Memory] Page " << pageID << " -> FAULT (Loading from Disk...)\n";
+            
+            if (frames.size() < TOTAL_FRAMES) {
+                // RAM has space
+                frames.push_back(pageID);
+                pageTable.push_back({pageID, currentTime});
+            } else {
+                // RAM is full -> Apply LRU Replacement
+                // Sort by lastAccessTime (Ascending)
+                sort(pageTable.begin(), pageTable.end(), [](PageEntry a, PageEntry b){
+                    return a.lastAccessTime < b.lastAccessTime;
+                });
+                
+                int victimPage = pageTable.front().pageID;
+                cout << "   [LRU Info] Memory Full. Swapping out Page " << victimPage << "\n";
+                
+                // Remove victim and add new page
+                pageTable.erase(pageTable.begin());
+                pageTable.push_back({pageID, currentTime});
+            }
+        }
+    }
+
+    void showStats() {
+        cout << "\n--- Memory Statistics ---\n";
+        cout << "Total Page Hits: " << hits << "\n";
+        cout << "Total Page Faults: " << faults << "\n";
+        cout << "Current Pages in RAM: [ ";
+        for(auto p : pageTable) cout << p.pageID << " ";
+        cout << "]\n-------------------------\n";
+    }
+};
+
+// ==========================================
+// MODULE 2: FILE VAULT (Security & Encryption)
+// ==========================================
+class FileVault {
+    map<string, FileRecord> storage;
+
+    // XOR Encryption Algorithm
+    string encryptDecrypt(string data) {
+        char key = 'K'; // Simple key
+        string output = data;
+        for (int i = 0; i < data.size(); i++) output[i] ^= key;
+        return output;
+    }
+
+    void writeLog(string user, string action, string status) {
+        ofstream logFile("hospital_sys.log", ios::app);
+        time_t now = time(0);
+        char* dt = ctime(&now);
+        string timeStr(dt); timeStr.pop_back(); // Remove newline
+        
+        logFile << "[" << timeStr << "] User: " << user 
+                << " | Action: " << action 
+                << " | Status: " << status << endl;
+    }
+
+public:
+    void createFile(string user, Role role, string fname, string content) {
+        // Requirement: Nurses cannot WRITE/CREATE
+        if (role == NURSE) {
+            cout << "!! ACCESS DENIED !! Nurses cannot create records.\n";
+            writeLog(user, "CREATE " + fname, "DENIED");
+            return;
+        }
+
+        string secureData = encryptDecrypt(content);
+        storage[fname] = {fname, secureData};
+        cout << ">> Success: File '" << fname << "' encrypted and saved.\n";
+        writeLog(user, "CREATE " + fname, "SUCCESS");
+    }
+
+    void readFile(string user, Role role, string fname) {
+        if (storage.find(fname) == storage.end()) {
+            cout << "!! Error: File not found.\n";
+            return;
+        }
+        
+        // Requirement: Everyone (Admin, Doc, Nurse) can READ
+        string rawData = encryptDecrypt(storage[fname].encryptedContent);
+        cout << ">> File Content (" << fname << "): " << rawData << "\n";
+        writeLog(user, "READ " + fname, "SUCCESS");
+    }
+};
+
+// ==========================================
+// MODULE 3: CPU SCHEDULER (2-Level + Aging)
+// ==========================================
+class Scheduler {
+    deque<Process> highQ;   // Priority Queue (Healthcare)
+    deque<Process> normalQ; // Round Robin Queue (Admin)
+    MemoryManager* memRef;  // Link to memory
+
+public:
+    Scheduler(MemoryManager* mm) { memRef = mm; }
+
+    void addProcess(int id, ProcessType type, int prio, int burst) {
+        Process p(id, type, prio, burst);
+        if (type == HEALTHCARE) highQ.push_back(p);
+        else normalQ.push_back(p);
+        cout << "Process " << id << " added to " << (type == HEALTHCARE ? "High Priority" : "Normal") << " Queue.\n";
+    }
+
+    void runScheduler() {
+        cout << "\n>>> STARTING CPU SCHEDULER <<<\n";
+        
+        while (!highQ.empty() || !normalQ.empty()) {
+            Process* current = nullptr;
+            bool isRR = false;
+
+            // --- 1. AGING CHECK ---
+            // If a normal process waits too long, promote it
+            for (auto it = normalQ.begin(); it != normalQ.end(); ) {
+                it->waitInQueue++;
+                if (it->waitInQueue > AGING_THRESHOLD) {
+                    cout << "[AGING] Process " << it->id << " waited too long! Promoting to High Priority.\n";
+                    Process promoted = *it;
+                    promoted.type = HEALTHCARE;
+                    promoted.priority++; // Boost priority
+                    highQ.push_back(promoted);
+                    it = normalQ.erase(it); // Remove from normal Q
+                } else {
+                    ++it;
+                }
+            }
+
+            // --- 2. SELECT PROCESS (Two-Level Logic) ---
+            if (!highQ.empty()) {
+                // Priority Scheduling: Sort by Priority (Simple Sort)
+                sort(highQ.begin(), highQ.end(), [](Process a, Process b){
+                    return a.priority > b.priority; 
+                });
+                current = &highQ.front();
+            } 
+            else if (!normalQ.empty()) {
+                current = &normalQ.front();
+                isRR = true;
+            }
+
+            // --- 3. EXECUTE ---
+            if (current) {
+                cout << "\n[CPU] Running Process " << current->id 
+                     << " (" << (current->type == HEALTHCARE ? "Health/High" : "Normal") << ")";
+                
+                // Simulate Memory Access
+                memRef->accessPage(current->id % 10); // Random page access based on ID
+
+                // Time Slice Logic
+                int executionTime = 1;
+                if (isRR) {
+                    // Round Robin Constraint
+                    executionTime = min(current->remainingTime, TIME_QUANTUM);
+                    current->remainingTime -= executionTime;
+                    cout << " -> Executed for " << executionTime << " sec (RR Slice).\n";
+                } else {
+                    // Priority runs until completion (Non-preemptive for simplicity)
+                    executionTime = current->remainingTime;
+                    current->remainingTime = 0;
+                    cout << " -> Executed until completion.\n";
+                }
+
+                // --- 4. CLEANUP or REQUEUE ---
+                if (current->remainingTime <= 0) {
+                    cout << "Process " << current->id << " COMPLETED.\n";
+                    if (isRR) normalQ.pop_front();
+                    else highQ.pop_front();
+                } else {
+                    // If RR and not finished, rotate to back
+                    if (isRR) {
+                        Process p = normalQ.front();
+                        normalQ.pop_front();
+                        p.waitInQueue = 0; // Reset wait time since it got CPU
+                        normalQ.push_back(p);
+                    }
+                }
+            }
+            // Add slight delay for visual effect
+            this_thread::sleep_for(chrono::milliseconds(500)); 
+        }
+        cout << "\n>>> ALL TASKS COMPLETED <<<\n";
+    }
+};
+
+// ==========================================
+// MAIN DRIVER (The Menu)
+// ==========================================
+int main() {
+    MemoryManager mem;
+    FileVault vault;
+    Scheduler cpu(&mem);
+
+    int choice;
+    while(true) {
+        cout << "\n=== SMART HOSPITAL OS (Teacher Demo) ===\n";
+        cout << "1. Add Emergency Task (High Priority)\n";
+        cout << "2. Add Admin Task (Normal/Round Robin)\n";
+        cout << "3. START SCHEDULER (Run CPU)\n";
+        cout << "4. File Vault (Test Security)\n";
+        cout << "5. Show Memory Stats\n";
+        cout << "6. Exit\n";
+        cout << "Select: ";
+        cin >> choice;
+
+        if (choice == 1) {
+            int pid, prio, burst;
+            cout << "Enter Process ID: "; cin >> pid;
+            cout << "Enter Priority (1-10): "; cin >> prio;
+            cout << "Enter Burst Time: "; cin >> burst;
+            cpu.addProcess(pid, HEALTHCARE, prio, burst);
+        }
+        else if (choice == 2) {
+            int pid, burst;
+            cout << "Enter Process ID: "; cin >> pid;
+            cout << "Enter Burst Time: "; cin >> burst;
+            // Default priority 0 for Normal tasks
+            cpu.addProcess(pid, NORMAL, 0, burst);
+        }
+        else if (choice == 3) {
+            cpu.runScheduler();
+        }
+        else if (choice == 4) {
+            string u, fname, content, action;
+            int r;
+            cout << "\n--- SECURITY PORTAL ---\n";
+            cout << "Login User: "; cin >> u;
+            cout << "Role (0:Admin, 1:Doc, 2:Nurse): "; cin >> r;
+            cout << "Action (read/create): "; cin >> action;
+            cout << "Filename: "; cin >> fname;
+
+            if (action == "create") {
+                cout << "Content: ";
+                cin.ignore(); getline(cin, content);
+                vault.createFile(u, (Role)r, fname, content);
+            } else {
+                vault.readFile(u, (Role)r, fname);
+            }
+        }
+        else if (choice == 5) {
+            mem.showStats();
+        }
+        else if (choice == 6) break;
+    }
+    return 0;
+}
